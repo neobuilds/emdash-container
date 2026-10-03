@@ -15,7 +15,7 @@ patterns = [
     rb'gh[pousr]_[A-Za-z0-9]{30,}',
     rb'github_pat_[A-Za-z0-9_]{40,}',
     rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=]{40,}',
-    rb'(?i)xclouddev/app-templates',
+    rb'(?i:xclouddev/app-templates)',
 ]
 regex = re.compile(b'|'.join(patterns))
 findings = []
