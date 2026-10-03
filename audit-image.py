@@ -1,8 +1,11 @@
 """Scan every saved image layer, including deleted files, before publication.
 Heuristic credential detection is not a guarantee that arbitrary secrets are absent.
 """
+import base64
 import hashlib
+import io
 import json
+import urllib.request
 import re
 import subprocess
 import sys
@@ -19,6 +22,30 @@ patterns = [
 ]
 regex = re.compile(b'|'.join(patterns))
 findings = []
+reviewed_public_fixtures = []
+# These three upstream files contain public self-test/development keys or npm
+# defaults. Accept only bytes identical to their pinned public source artifacts.
+known_public = {}
+base = Path('Dockerfile').read_text().splitlines()[0].split()[1]
+subprocess.run(['docker', 'pull', base], check=True, stdout=subprocess.DEVNULL)
+cid = subprocess.check_output(['docker', 'create', base], text=True).strip()
+try:
+    architecture = subprocess.check_output(['docker', 'image', 'inspect', image, '--format', '{{.Architecture}}'], text=True).strip()
+    triplet = {'amd64': 'x86_64', 'arm64': 'aarch64'}[architecture]
+    for path in ['usr/local/lib/node_modules/npm/.npmrc', f'usr/lib/{triplet}-linux-gnu/libgnutls.so.30.34.3']:
+        data = subprocess.check_output(['docker', 'cp', cid + ':/' + path, '-'])
+        with tarfile.open(fileobj=io.BytesIO(data)) as copied:
+            member = next(m for m in copied if m.isfile())
+            known_public[path] = hashlib.sha256(copied.extractfile(member).read()).hexdigest()
+finally:
+    subprocess.run(['docker', 'rm', cid], check=True, stdout=subprocess.DEVNULL)
+package = json.loads(Path('package-lock.json').read_text())['packages']['node_modules/miniflare']
+assert package['resolved'].startswith('https://registry.npmjs.org/miniflare/')
+with urllib.request.urlopen(package['resolved'], timeout=60) as response:
+    data = response.read()
+assert package['integrity'] == 'sha512-' + base64.b64encode(hashlib.sha512(data).digest()).decode()
+with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as npm:
+    known_public['app/node_modules/miniflare/dist/src/index.js'] = hashlib.sha256(npm.extractfile('package/dist/src/index.js').read()).hexdigest()
 files = 0
 readmes = []
 with tempfile.TemporaryDirectory(prefix='emdash-layer-audit-') as tmp:
@@ -40,8 +67,7 @@ with tempfile.TemporaryDirectory(prefix='emdash-layer-audit-') as tmp:
                         continue
                     files += 1
                     path = member.name
-                    if '/.git/' in '/' + path or path.endswith(('/.npmrc', '/.git-credentials', '/id_rsa', '/id_ed25519')):
-                        findings.append({'path': path, 'reason': 'sensitive filename'})
+                    sensitive_path = '/.git/' in '/' + path or path.endswith(('/.npmrc', '/.git-credentials', '/id_rsa', '/id_ed25519'))
                     f = contents.extractfile(member)
                     digest = hashlib.sha256()
                     previous = b''
@@ -54,11 +80,14 @@ with tempfile.TemporaryDirectory(prefix='emdash-layer-audit-') as tmp:
                         if regex.search(previous + chunk):
                             matched = True
                         previous = chunk[-512:]
-                    if matched:
-                        findings.append({'path': path, 'reason': 'credential or private-repository pattern'})
+                    if matched or sensitive_path:
+                        if known_public.get(path) == digest.hexdigest():
+                            reviewed_public_fixtures.append({'path': path, 'sha256': digest.hexdigest(), 'basis': 'byte-identical pinned public dependency'})
+                        else:
+                            findings.append({'path': path, 'reason': 'credential/private-reference pattern or sensitive filename'})
                     if path.lower().endswith('readme.md') and 'node_modules/' not in path:
                         readmes.append({'path': path, 'sha256': digest.hexdigest()})
-        result = {'image': image, 'layers': len(manifest['Layers']), 'files_scanned': files, 'labels': labels, 'non_dependency_readmes': readmes, 'findings': findings, 'limitations': 'Heuristic scan; public upstream dependencies can contain test fixtures. Build inputs are separately allowlisted.'}
+        result = {'image': image, 'layers': len(manifest['Layers']), 'files_scanned': files, 'labels': labels, 'non_dependency_readmes': readmes, 'findings': findings, 'reviewed_public_fixtures': reviewed_public_fixtures, 'limitations': 'Heuristic scan; public upstream dependencies can contain test fixtures. Build inputs are separately allowlisted.'}
         Path(output).write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result, indent=2))
         assert not findings, 'Public-content audit requires review'
